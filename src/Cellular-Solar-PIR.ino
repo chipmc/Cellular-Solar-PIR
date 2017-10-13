@@ -5,11 +5,45 @@
 * Date:8 October 2017
 */
 
+// On the solar installation I am not using the hardware watchdog 
 
 // Easy place to change global numbers
+//These defines let me change the memory map and configuration without hunting through the whole program
+#define VERSIONNUMBER 7             // Increment this number each time the memory map is changed
+#define WORDSIZE 8                  // For the Word size
+#define PAGESIZE 4096               // Memory size in bytes / word size - 256kb FRAM
+// First Word - 8 bytes for setting global values
+#define DAILYOFFSET 2               // First word of daily counts
+#define HOURLYOFFSET 30             // First word of hourly counts (remember we start counts at 1)
+#define DAILYCOUNTNUMBER 28         // used in modulo calculations - sets the # of days stored
+#define HOURLYCOUNTNUMBER 4064      // used in modulo calculations - sets the # of hours stored - 256k (4096-14-2)
+#define VERSIONADDR 0x0             // Memory Locations By Name not Number
+#define SENSITIVITYADDR 0x1         // For the 1st Word locations
+#define DEBOUNCEADDR 0x2            // One byte for debounce (stored in cSec mult by 10 for mSec)
+#define RESETCOUNT 0x3              // This is where we keep track of how often the Electron was reset
+#define DAILYPOINTERADDR 0x4        // One byte for daily pointer
+#define HOURLYPOINTERADDR 0x5       // Two bytes for hourly pointer
+#define CONTROLREGISTER 0x7         // This is the control register acted on by both Simblee and Arduino
+//Second Word - 8 bytes for storing current counts
+#define CURRENTHOURLYCOUNTADDR 0x8  // Current Hourly Count
+#define CURRENTDAILYCOUNTADDR 0xA   // Current Daily Count
+#define CURRENTCOUNTSTIME 0xC       // Time of last count
+//These are the hourly and daily offsets that make up the respective words
+#define DAILYDATEOFFSET 1           //Offsets for the value in the daily words
+#define DAILYCOUNTOFFSET 2          // Count is a 16-bt value
+#define DAILYBATTOFFSET 4           // Where the battery charge is stored
+#define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
+#define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
+// Finally, here are the variables I want to change often and pull them all together here
 #define SOFTWARERELEASENUMBER "0.15"
 #define PARKCLOSES 22
 #define PARKOPENS 7
+
+// Included Libraries
+#include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
+#include "FRAM-Library-Extensions.h"                     // Extends the FRAM Library
+#include "electrondoc.h"                                 // Documents pinout
+
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);    // This will enable user code to start executing automatically.
@@ -40,6 +74,7 @@ int currentPeriod = 0;                      // Change length of period for testi
 
 // Program Variables
 int temperatureF;                    // Global variable so we can monitor via cloud variable
+int resetCount;                      // Counts the number of times the Electron has had a pin reset
 bool ledState = LOW;                        // variable used to store the last LED status, to toggle the light
 const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on the menu
 
@@ -82,22 +117,71 @@ void setup()
   Serial.print(F("Electron-Sleep-Test-PIR - release "));
   Serial.println(releaseNumber);
 
-  pinMode(intPin,INPUT);                      // PIR interrupt pinMode
-  pinMode(blueLED, OUTPUT);                   // declare the Blue LED Pin as an output
-
-  attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
-
-  Particle.variable("Release",releaseNumber); // Make sure we know what version of software is running
-  Particle.variable("stateOfChg", stateOfCharge); // Track Battery Level
-
-  Time.zone(-4);                              // Set time zone to Eastern USA daylight saving time
-
   //pmic.setChargeCurrent(0,0,1,0,0,0);         //Set charging current to 1024mA (512 + 512 offset) thank you @RWB for these two lines
   pmic.setInputVoltageLimit(4840);            //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts.
   stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charg
   Serial.print("Charge current limit is: ");
   Serial.println(pmic.getChargeCurrent());
 
+  pinMode(intPin,INPUT);                      // PIR interrupt pinMode
+  pinMode(blueLED, OUTPUT);                   // declare the Blue LED Pin as an output
+
+  attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
+  char responseTopic[125];
+  String deviceID = System.deviceID();
+  deviceID.toCharArray(responseTopic,125);
+  Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
+
+  Particle.variable("HourlyCount", hourlyPersonCount);
+  Particle.variable("DailyCount", dailyPersonCount);
+  Particle.variable("Signal", Signal);
+  Particle.variable("ResetCount", resetCount);
+  Particle.variable("Temperature",temperatureF);
+  Particle.variable("Release",releaseNumber);
+  Particle.variable("stateOfChg", stateOfCharge);
+
+  Particle.function("startStop", startStop);
+  Particle.function("resetFRAM", resetFRAM);
+  Particle.function("resetCounts",resetCounts);
+  Particle.function("SendNow",sendNow);
+
+  if (fram.begin()) {                // you can stick the new i2c addr in here, e.g. begin(0x51);
+    Serial.println(F("Found I2C FRAM"));
+  } else {
+    Serial.println(F("No I2C FRAM found ... check your connections"));
+  }
+
+  if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {  // Check to see if the memory map in the sketch matches the data on the chip
+    Serial.print(F("FRAM Version Number: "));
+    Serial.println(FRAMread8(VERSIONADDR));
+    Serial.read();
+    Serial.println(F("Memory/Sketch mismatch! Erase FRAM? (Y/N)"));
+    while (!Serial.available());
+    switch (Serial.read()) {    // Give option to erase and reset memory
+    case 'Y':
+      ResetFRAM();
+      break;
+    case 'y':
+      ResetFRAM();
+      break;
+    default:
+      Serial.println(F("Cannot proceed"));
+      BlinkForever();
+    }
+  }
+
+  resetCount = FRAMread8(RESETCOUNT);         // Retrive system recount data from FRAMwrite8
+  if (System.resetReason() == RESET_REASON_PIN_RESET)  // Check to see if we are starting from a pin reset
+  {
+  resetCount++;
+  FRAMwrite8(RESETCOUNT,resetCount);          // If so, store incremented number - watchdog must have done This
+  }
+  Serial.print("Reset count: ");
+  Serial.println(resetCount);
+
+  Time.zone(-4);                              // Set time zone to Eastern USA daylight saving time
+  getSignalStrength();                        // Test signal strength at startup
+  StartStopTest(1);                           // Default action is for the test to be running
   state = IDLE_STATE;                         // Idle and look for events to change the state
 }
 
@@ -192,6 +276,110 @@ void recordCount()                                          // Handles counting 
   }
 }
 
+void StartStopTest(boolean startTest)  // Since the test can be started from the serial menu or the Simblee - created a function
+ {
+     if (startTest) {
+         inTest = true;
+         t = Time.now();                    // Gets the current time
+         currentHourlyPeriod = Time.hour();   // Sets the hour period for when the count starts (see #defines)
+         currentDailyPeriod = Time.day();     // And the day  (see #defines)
+         // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over
+         time_t unixTime = FRAMread32(CURRENTCOUNTSTIME);
+         lastHour = Time.hour(unixTime);
+         lastDate = Time.day(unixTime);
+         dailyPersonCount = FRAMread16(CURRENTDAILYCOUNTADDR);  // Load Daily Count from memory
+         hourlyPersonCount = FRAMread16(CURRENTHOURLYCOUNTADDR);  // Load Hourly Count from memory
+         if (currentDailyPeriod != lastDate) {
+             LogHourlyEvent();
+             LogDailyEvent();
+         }
+         else if (currentHourlyPeriod != lastHour) {
+             LogHourlyEvent();
+         }
+         Serial.println(F("Test Started"));
+     }
+     else {
+         inTest = false;
+         t = Time.now();
+         FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
+         FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
+         FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
+         hourlyPersonCount = 0;        // Reset Person Count
+         dailyPersonCount = 0;         // Reset Person Count
+         Serial.println(F("Test Stopped"));
+     }
+ }
+
+void LogHourlyEvent() // Log Hourly Event()
+{
+  time_t LogTime = FRAMread32(CURRENTCOUNTSTIME);     // This is the last event recorded - this sets the hourly period
+  unsigned int pointer = (HOURLYOFFSET + FRAMread16(HOURLYPOINTERADDR))*WORDSIZE;  // get the pointer from memory and add the offset
+  LogTime -= (60*Time.minute(LogTime) + Time.second(LogTime)); // So, we need to subtract the minutes and seconds needed to take to the top of the hour
+  FRAMwrite32(pointer, LogTime);   // Write to FRAM - this is the end of the period
+  FRAMwrite16(pointer+HOURLYCOUNTOFFSET,hourlyPersonCount);
+  stateOfCharge = int(batteryMonitor.getSoC());
+  FRAMwrite8(pointer+HOURLYBATTOFFSET,stateOfCharge);
+  unsigned int newHourlyPointerAddr = (FRAMread16(HOURLYPOINTERADDR)+1) % HOURLYCOUNTNUMBER;  // This is where we "wrap" the count to stay in our memory space
+  FRAMwrite16(HOURLYPOINTERADDR,newHourlyPointerAddr);
+}
+
+ void LogDailyEvent() // Log Daily Event()
+ {
+   time_t LogTime = FRAMread32(CURRENTCOUNTSTIME);// This is the last event recorded - this sets the daily period
+   int pointer = (DAILYOFFSET + FRAMread8(DAILYPOINTERADDR))*WORDSIZE;  // get the pointer from memory and add the offset
+   FRAMwrite8(pointer,Time.month(LogTime)); // The month of the last count
+   FRAMwrite8(pointer+DAILYDATEOFFSET,Time.day(LogTime));  // Write to FRAM - this is the end of the period  - should be the day
+   FRAMwrite16(pointer+DAILYCOUNTOFFSET,dailyPersonCount);
+   stateOfCharge = batteryMonitor.getSoC();
+   FRAMwrite8(pointer+DAILYBATTOFFSET,stateOfCharge);
+   byte newDailyPointerAddr = (FRAMread8(DAILYPOINTERADDR)+1) % DAILYCOUNTNUMBER;  // This is where we "wrap" the count to stay in our memory space
+   FRAMwrite8(DAILYPOINTERADDR,newDailyPointerAddr);
+ }
+
+ void sendEvent(bool dailyEvent)
+ {
+   getSignalStrength();
+   int currentTemp = getTemperature();  // in degrees F
+   stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charge
+   digitalWrite(donePin, HIGH);
+   digitalWrite(donePin,LOW);     // Pet the dog so we have a full period for a response
+   doneEnabled = false;           // Can't pet the dog unless we get a confirmation via Webhook Response and the right Ubidots code.
+   char data[256];                                         // Store the date in this character array - not global
+   snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i}",hourlyPersonCount, dailyPersonCount, stateOfCharge, currentTemp);
+   Particle.publish("Send_Counts", data, PRIVATE);
+   if (dailyEvent)
+   {
+     dailyPersonCountSent = dailyPersonCount; // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
+     currentDailyPeriod = Time.day();  // Change the time period
+   }
+   hourlyPersonCountSent = hourlyPersonCount; // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
+   dataInFlight = true; // set the data in flight flag
+   currentHourlyPeriod = Time.hour();  // Change the time period
+   Serial.println(F("Event Sent"));
+ }
+
+void UbidotsHandler(const char *event, const char *data)  // Looks at the response from Ubidots - Will reset Photon if no successful response
+{
+  // Response Template: "{{hourly.0.status_code}}"
+  if (!data) {                                            // First check to see if there is any data
+    Particle.publish("UbidotsResp", "No Data");
+    return;
+  }
+  int responseCode = atoi(data);                          // Response is only a single number thanks to Template
+  if ((responseCode == 200) || (responseCode == 201))
+  {
+    Particle.publish("UbidotsHook","Success");
+    Serial.println("Request successfully completed");
+    dataInFlight = false;                                 // Data has been received
+    doneEnabled = true;                                   // Successful response - can pet the dog again
+    digitalWrite(donePin, HIGH);                          // If an interrupt came in while petting disabled, we missed it so...
+    digitalWrite(donePin, LOW);                           // will pet the dog just to be safe
+  }
+  else Particle.publish("UbidotsHook", data);             // Publish the response code
+}
+
+
+
 void getSignalStrength()
 {
     CellularSignal sig = Cellular.RSSI();  // Prototype for Cellular Signal Montoring
@@ -199,6 +387,81 @@ void getSignalStrength()
     int strength = map(rssi, -131, -51, 0, 5);
     sprintf(Signal, "%s: %d", levels[strength], rssi);
 }
+
+int startStop(String command)   // Will reset the local counts
+{
+  if (command == "1" && !inTest)
+  {
+    StartStopTest(1);
+    return 1;
+  }
+  else if (command == "0" && inTest)
+  {
+    StartStopTest(0);
+    return 1;
+  }
+  else
+  {
+    Serial.print("Got here but did not work: ");
+    Serial.println(command);
+    return 0;
+  }
+}
+
+int resetFRAM(String command)   // Will reset the local counts
+{
+  if (command == "1")
+  {
+    ResetFRAM();
+    return 1;
+  }
+  else return 0;
+}
+
+int resetCounts(String command)   // Resets the current hourly and daily counts
+{
+  if (command == "1")
+  {
+    FRAMwrite16(CURRENTDAILYCOUNTADDR, 0);   // Reset Daily Count in memory
+    FRAMwrite16(CURRENTHOURLYCOUNTADDR, 0);  // Reset Hourly Count in memory
+    hourlyPersonCount = 0;                    // Reset count variables
+    dailyPersonCount = 0;
+    hourlyPersonCountSent = 0;                // In the off-chance there is data in flight
+    dataInFlight = false;
+    return 1;
+  }
+  else return 0;
+}
+
+int sendNow(String command) // Function to force sending data in current hour
+{
+  if (command == "1")
+  {
+    sendEvent(0);
+    return 1;
+  }
+  else return 0;
+}
+
+int getTemperature()
+{
+  int reading = analogRead(tmp36Pin);   //getting the voltage reading from the temperature sensor
+  float voltage = reading * 3.3;        // converting that reading to voltage, for 3.3v arduino use 3.3
+  voltage /= 4096.0;                    // Electron is different than the Arduino where there are only 1024 steps
+  int temperatureC = int(((voltage - 0.5) * 100));  //converting from 10 mv per degree with 500 mV offset to degrees ((voltage - 500mV) times 100) - 5 degree calibration
+  temperatureF = int((temperatureC * 9.0 / 5.0) + 32.0);  // now convert to Fahrenheit
+  return temperatureF;
+}
+
+void watchdogISR()
+{
+  if (doneEnabled)
+  {
+    digitalWrite(donePin, HIGH);
+    digitalWrite(donePin, LOW);
+  }
+}
+
 
 void sensorISR()
 {
