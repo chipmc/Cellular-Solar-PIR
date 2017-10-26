@@ -77,7 +77,7 @@ boolean Adafruit_FRAM_I2C::begin(uint8_t addr)
 
 /**************************************************************************/
 /*!
-    @brief  Writes a byte at the specific FRAM address
+    @brief  Writes a uint8_t at the specific FRAM address
 
     @params[in] i2cAddr
                 The I2C address of the FRAM memory chip (1010+A2+A1+A0)

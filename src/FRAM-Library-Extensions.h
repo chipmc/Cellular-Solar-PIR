@@ -29,12 +29,12 @@ int FRAMread16(unsigned int address)
 
 void FRAMwrite16(unsigned int address, int value)   // Write 16 bits to FRAM
 {
-    //This function will write a 2 byte (16bit) long to the eeprom at
+    //This function will write a 2 uint8_t (16bit) long to the eeprom at
     //the specified address to address + 1.
     //Decomposition from a long to 2 bytes by using bitshift.
     //One = Most significant -> Four = Least significant byte
-    byte two = (value & 0xFF);
-    byte one = ((value >> 8) & 0xFF);
+    uint8_t two = (value & 0xFF);
+    uint8_t one = ((value >> 8) & 0xFF);
     //Write the 2 bytes into the eeprom memory.
     fram.write8(address, two);
     fram.write8(address + 1, one);
@@ -57,14 +57,14 @@ unsigned long FRAMread32(unsigned long address)
 
 void FRAMwrite32(int address, unsigned long value)  // Write 32 bits to FRAM
 {
-    //This function will write a 4 byte (32bit) long to the eeprom at
+    //This function will write a 4 uint8_t (32bit) long to the eeprom at
     //the specified address to address + 3.
     //Decomposition from a long to 4 bytes by using bitshift.
     //One = Most significant -> Four = Least significant byte
-    byte four = (value & 0xFF);
-    byte three = ((value >> 8) & 0xFF);
-    byte two = ((value >> 16) & 0xFF);
-    byte one = ((value >> 24) & 0xFF);
+    uint8_t four = (value & 0xFF);
+    uint8_t three = ((value >> 8) & 0xFF);
+    uint8_t two = ((value >> 16) & 0xFF);
+    uint8_t one = ((value >> 24) & 0xFF);
     //Write the 4 bytes into the eeprom memory.
     fram.write8(address, four);
     fram.write8(address + 1, three);
