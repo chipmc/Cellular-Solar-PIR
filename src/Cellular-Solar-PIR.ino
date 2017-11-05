@@ -35,7 +35,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.25"
+#define SOFTWARERELEASENUMBER "0.56"
 #define PARKCLOSES 20
 #define PARKOPENS 7
 
@@ -60,17 +60,22 @@ const int blueLED = D7;                     // This LED is on the Electron itsel
 const int userSwitch = D5;                  // User switch with a pull-up resistor
 const int tmp36Pin = A0;                    // Simple Analog temperature sensor
 const int tmp36Shutdwn = B5;                // Can turn off the TMP-36 to save energy
+const int donePin = D6;                     // Pin the Electron uses to "pet" the watchdog
+const int wakeUpPin = A7;                   // This is the Particle Electron WKP pin
+const int hardResetPin = D4;                // Power Cycles the Electron and the Carrier Board
+
 
 // Timing Variables
-int publishTimeStamp = 0;         // Keep track of when we publish a webhook
-int webhookWaitTime = 10000;      // How long will we let a webhook go before we give up
-int resetWaitTimeStamp = 0;       // Starts the reset wait clock
-int resetWaitTime = 30000;        // Will wait this lonk before resetting.
-int sleepDelay = 90000;           // Longer delay before sleep when booting up or on the hour - gives time to flash
-int timeTillSleep = 0;            // This will either be short or long depending on nap or sleep
-int napDelay = 3000;              // Normal amount of time after event before taking a nap
-int lastEvent = 0;                // Keeps track of the last time there was an event
-bool waiting = false;
+unsigned long publishTimeStamp = 0;         // Keep track of when we publish a webhook
+unsigned long webhookWaitTime = 45000;      // How long will we let a webhook go before we give up
+unsigned long resetWaitTimeStamp = 0;       // Starts the reset wait clock
+unsigned long resetWaitTime = 30000;        // Will wait this lonk before resetting.
+unsigned long sleepDelay = 90000;           // Longer delay before sleep when booting up or on the hour - gives time to flash
+unsigned long timeTillSleep = 0;            // This will either be short or long depending on nap or sleep
+unsigned long napDelay = 3000;              // Normal amount of time after event before taking a nap
+unsigned long lastEvent = 0;                // Keeps track of the last time there was an event
+bool waiting = false;                       // Keeps track of things that are in flight - enables non-blocking code
+bool readyForBed = false;                   // Keeps track of the things that you do once before sleep
 
 // Program Variables
 int temperatureF;                    // Global variable so we can monitor via cloud variable
@@ -99,32 +104,34 @@ int stateOfCharge = 0;                      // stores battery charge level value
 //Menu and Program Variables
 uint32_t lastBump = 0;         // set the time of an event
 bool inTest = false;             // Are we in a test or not
-uint16_t numberHourlyDataPoints;         // How many hourly counts are there
-uint16_t numberDailyDataPoints;          // How many daily counts are there
 retained char Signal[17];                            // Used to communicate Wireless RSSI and Description
 const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
 
 void setup()
 {
-  Particle.connect();                         // Connect to Particle on bootup - will disonnect on nap or sleep
+  pinMode(intPin,INPUT);
+  pinMode(wakeUpPin,INPUT);                   // This pin is active HIGH
+  pinMode(blueLED, OUTPUT);                   // declare the Blue LED Pin as an output
+  pinMode(tmp36Shutdwn,OUTPUT);               // Supports shutting down the TMP-36 to save juice
+  digitalWrite(tmp36Shutdwn, HIGH);           // Turns on the temp sensor
+  pinMode(donePin,OUTPUT);                    // Allows us to pet the watchdog
+  pinMode(hardResetPin,OUTPUT);               // For a hard reset - HIGH
 
+  if(!connectToParticle()) digitalWrite(hardResetPin,HIGH);    // If connection fails, bounce the power
   Particle.publish("State","Initalizing");
 
   power.begin();
   power.disableWatchdog();
   power.disableDPDM();
-  power.setInputVoltageLimit(4840); //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
+  power.setInputVoltageLimit(4840);     //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
   power.setInputCurrentLimit(900);     // default is 900mA
   power.setChargeCurrent(0,0,0,0,0,0); // default is 512mA
   power.setChargeVoltage(4112);        // default is 4.112V termination voltage
+  power.enableDPDM();
 
   stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charge
 
-  pinMode(intPin,INPUT);                      // PIR interrupt pinMode
-  pinMode(blueLED, OUTPUT);                   // declare the Blue LED Pin as an output
-  pinMode(tmp36Shutdwn,OUTPUT);               // Supports shutting down the TMP-36 to save juice
-  digitalWrite(tmp36Shutdwn, HIGH);           // Turns on the temp sensor
-
+  attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
   attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
 
   char responseTopic[125];
@@ -165,9 +172,7 @@ void setup()
   }
 
   Time.zone(-4);                              // Set time zone to Eastern USA daylight saving time
-  getSignalStrength();                        // Test signal strength at startup
-  getTemperature();                           // Get Temperature at startup as well
-  stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charge
+  takeMeasurements();
   StartStopTest(1);                           // Default action is for the test to be running
   timeTillSleep = sleepDelay;                 // Set initial delay for 60 seconds
 
@@ -188,81 +193,84 @@ void loop()
       FRAMwrite16(CURRENTHOURLYCOUNTADDR, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
       hourlyPersonCountSent = 0;
     }
-    if(dailyPersonCountSent) {
-      dailyPersonCount -= dailyPersonCountSent;
-      FRAMwrite16(CURRENTDAILYCOUNTADDR,static_cast<uint16_t>(dailyPersonCount));
-      dailyPersonCountSent = 0;
-    }
-    if (sensorDetect) recordCount();                                    // The ISR had raised the sensor flag
-    if (millis() >= (lastEvent + timeTillSleep)) state = NAPPING_STATE;    // Too long since last sensor flag - time to nap
-    if (Time.hour() >= PARKCLOSES) state = SLEEPING_STATE;              // The park is closed, time to sleep
-    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;    // We want to report on the hour
+    if (sensorDetect) recordCount();                                                  // The ISR had raised the sensor flag
+    if (millis() >= (lastEvent + timeTillSleep)) state = NAPPING_STATE;               // Too long since last sensor flag - time to nap
+    if (Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS) state = SLEEPING_STATE;  // The park is closed, time to sleep
+    if (Time.hour() != currentHourlyPeriod && !readyForBed) state = REPORTING_STATE;   // We want to report on the hour but not after bedtime
     break;
 
-  case SLEEPING_STATE: {
-    if (Particle.connected()) {
-    Particle.disconnect();                                   // Disconnect from Particle in prep for sleep
-    delay(3000);
-    Cellular.disconnect();                                   // Disconnect from the cellular network
-    delay(3000);
-    Cellular.off();                                           // Turn off the cellular modem
+  case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
+    if (!readyForBed)                                           // Only do these things once - at bedtime
+    {
+      if (Particle.connected()) {
+        disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
+      }
+      detachInterrupt(intPin);                                  // Done sensing for the day
+      dailyPersonCount = 0;                                     // All the counts have been reported so time to zero everything
+      FRAMwrite16(CURRENTDAILYCOUNTADDR, 0);                    // Reset the counts in FRAM as well
+      resetCount = 0;
+      FRAMwrite8(RESETCOUNT,resetCount);
+      hourlyPersonCount = 0;
+      FRAMwrite16(CURRENTHOURLYCOUNTADDR, 0);
+      ledState = false;
+      digitalWrite(blueLED,LOW);                                // Turn off the LED
+      digitalWrite(tmp36Shutdwn, LOW);                          // Turns off the temp sensor
+      digitalWrite(donePin,HIGH);
+      digitalWrite(donePin,LOW);                                // Pet the watchdog
+      readyForBed = true;                                       // Set the flag for the night
     }
-    ledState = false;
-    digitalWrite(blueLED,LOW);                               // Turn off the LED
-    long secondsToOpen = (3600*(24 - Time.hour()+PARKOPENS));  // Set the alarm (in seconds) till park opens again
-    System.sleep(SLEEP_MODE_DEEP,secondsToOpen);              // Sleep till morning
-    lastEvent = millis();                                    // Reset millis so we don't wake and then nap again
-    state = REPORTING_STATE;                                  // Report when we wake from sleep
+    int secondsToHour = (60*(60 - Time.minute()));              // Time till the top of the hour
+    System.sleep(SLEEP_MODE_DEEP,secondsToHour);        // Very deep sleep till the next hour (cellular, uC and Fuel Gauge off)
+    digitalWrite(donePin,HIGH);
+    digitalWrite(donePin,LOW);                                  // Pet the watchdog
+    if (Time.hour() < PARKCLOSES && Time.hour() >= PARKOPENS)   // Time to wake up and go to work
+    {
+      state = IDLE_STATE;                                       // Go to IDLE state for more instructions once we awake
+      lastEvent = millis();                                     // Reset millis so we don't wake and then nap again
+      attachInterrupt(intPin,sensorISR,RISING);                 // Sensor interrupt from low to high
+      currentDailyPeriod = Time.day();                          // Waking from a night's sleep - it is a new day
+      digitalWrite(tmp36Shutdwn,HIGH);                          // Turn on the temp sensor
+      readyForBed = false;
+    }
     } break;
 
   case NAPPING_STATE: {
     if (Particle.connected())
     {
-      Particle.disconnect();                                   // Disconnect from Particle in prep for sleep
-      delay(3000);
-      Cellular.disconnect();                                   // Disconnect from the cellular network
-      delay(3000);
-      Cellular.off();                                         // Turn off the cellular modem
-      timeTillSleep = napDelay;
+      disconnectFromParticle();                              // If connected, we need to disconned and power down the modem
+      timeTillSleep = napDelay;                              // Set the time we will wait before napping again
     }
     ledState = false;                                        // Turn out the light
     digitalWrite(blueLED,LOW);                               // Turn off the LED
     sensorDetect = true;                                     // Woke up so there must have been an event
     lastEvent = millis();                                    // Reset millis so we don't wake and then nap again
-    int secondsToHour = (60*(60 - Time.minute()));          // Time till the top of the hour
+    int secondsToHour = (60*(60 - Time.minute()));           // Time till the top of the hour
     System.sleep(intPin,RISING,secondsToHour);               // Sensor will wake us with an interrupt
-    attachInterrupt(intPin,sensorISR,RISING);                // Sensor interrupt from low to high
     state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
     } break;
 
   case REPORTING_STATE: {
     timeTillSleep = sleepDelay;     // Sets the sleep delay to 60 seconds after reporting to give time to flash if needed
-    Cellular.on();                                           // turn on the Modem
-    Cellular.connect();                                      // Connect to the cellular network
-    while(!Cellular.ready())
-    Particle.connect();                                      // Connect to Particle
-    waitUntil(Particle.connected);
-    if (Time.day() != currentDailyPeriod) {     // Time to log a daily event takes precedence over hourly event
-      Particle.publish("State","Reporting Day");         // Temp - for debugging
-      LogHourlyEvent();
-      LogDailyEvent();
-      sendEvent(true);
+    if (!connectToParticle()) {
+      state = ERROR_STATE;
+      break;
     }
-    else if ((Time.hour() != currentHourlyPeriod)) {  // Spring into action each hour on the hour as long as we have counts
-      Particle.publish("State","Reporting Hour");         // Temp - for debugging
-      LogHourlyEvent();
-      sendEvent(false);
-    }
+    takeMeasurements();
+    LogHourlyEvent();
+    sendEvent();
     publishTimeStamp = millis();
+    digitalWrite(donePin,HIGH);
+    digitalWrite(donePin,LOW);                          // Pet the watchdog once an hour
     Particle.publish("State","Waiting for Response");
-    state = RESP_WAIT_STATE;                         // Wait for Response
+    state = RESP_WAIT_STATE;                            // Wait for Response
     } break;
 
   case RESP_WAIT_STATE:
-    if (!dataInFlight) // Response received
+    if (!dataInFlight)                                  // Response received
     {
       if (stateOfCharge <= 20) state = ERROR_STATE;     // Very low battery, time to reset then sleep
       else state = IDLE_STATE;                          // Battery OK, proceed
+      Particle.publish("State","Idle");
     }
     else if (millis() >= (publishTimeStamp + webhookWaitTime)) state = ERROR_STATE;  // Response timed out
     break;
@@ -272,7 +280,7 @@ void loop()
     {
       waiting = true;
       resetWaitTimeStamp = millis();
-      Particle.publish("State","Resetting in 30 sec");
+      Particle.publish("State","Error");
     }
     if (millis() >= (resetWaitTimeStamp + resetWaitTime)) System.reset();   // Today, only way out is reset
     break;
@@ -284,19 +292,14 @@ void recordCount()                                          // Handles counting 
   sensorDetect = false;                                     // Reset the flag
   if (digitalRead(intPin)) {
     Particle.publish("State","Counting");
-    lastEvent = millis();                                     // Important to keep from napping too soon
+    if (Time.minute() > 2) timeTillSleep = napDelay;        // reset the time we will wait before napping again
+    lastEvent = millis();                                   // Important to keep from napping too soon
     t = Time.now();
     hourlyPersonCount++;                    // Increment the PersonCount
     FRAMwrite16(CURRENTHOURLYCOUNTADDR, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
     dailyPersonCount++;                    // Increment the PersonCount
     FRAMwrite16(CURRENTDAILYCOUNTADDR, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
     FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
-    Serial.print(F("Hourly: "));
-    Serial.print(hourlyPersonCount);
-    Serial.print(F(" Daily: "));
-    Serial.print(dailyPersonCount);
-    Serial.print(F("  Time: "));
-    Serial.println(Time.timeStr(t)); // Prints time t - example: Wed May 21 01:08:47 2014
     ledState = !ledState;              // toggle the status of the LEDPIN:
     digitalWrite(blueLED, ledState);    // update the LED pin itself
   }
@@ -314,19 +317,13 @@ void StartStopTest(boolean startTest)  // Since the test can be started from the
      lastDate = Time.day(unixTime);
      dailyPersonCount = FRAMread16(CURRENTDAILYCOUNTADDR);  // Load Daily Count from memory
      hourlyPersonCount = FRAMread16(CURRENTHOURLYCOUNTADDR);  // Load Hourly Count from memory
-     if (currentDailyPeriod != lastDate) {
-         LogHourlyEvent();
-         LogDailyEvent();
-     }
-     else if (currentHourlyPeriod != lastHour) {
-         LogHourlyEvent();
-     }
+     if (currentHourlyPeriod != lastHour) LogHourlyEvent();
  }
  else {
      inTest = false;
      t = Time.now();
-     FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
-     FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
+     FRAMwrite16(CURRENTDAILYCOUNTADDR, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
+     FRAMwrite16(CURRENTHOURLYCOUNTADDR, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
      FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
      hourlyPersonCount = 0;        // Reset Person Count
      dailyPersonCount = 0;         // Reset Person Count
@@ -340,42 +337,19 @@ void LogHourlyEvent() // Log Hourly Event()
   LogTime -= (60*Time.minute(LogTime) + Time.second(LogTime)); // So, we need to subtract the minutes and seconds needed to take to the top of the hour
   FRAMwrite32(pointer, LogTime);   // Write to FRAM - this is the end of the period
   FRAMwrite16(pointer+HOURLYCOUNTOFFSET,static_cast<uint16_t>(hourlyPersonCount));
-  stateOfCharge = int(batteryMonitor.getSoC());
   FRAMwrite8(pointer+HOURLYBATTOFFSET,stateOfCharge);
   unsigned int newHourlyPointerAddr = (FRAMread16(HOURLYPOINTERADDR)+1) % HOURLYCOUNTNUMBER;  // This is where we "wrap" the count to stay in our memory space
   FRAMwrite16(HOURLYPOINTERADDR,newHourlyPointerAddr);
 }
 
-void LogDailyEvent() // Log Daily Event()
+void sendEvent()
 {
- time_t LogTime = FRAMread32(CURRENTCOUNTSTIME);// This is the last event recorded - this sets the daily period
- int pointer = (DAILYOFFSET + FRAMread8(DAILYPOINTERADDR))*WORDSIZE;  // get the pointer from memory and add the offset
- FRAMwrite8(pointer,Time.month(LogTime)); // The month of the last count
- FRAMwrite8(pointer+DAILYDATEOFFSET,Time.day(LogTime));  // Write to FRAM - this is the end of the period  - should be the day
- FRAMwrite16(pointer+DAILYCOUNTOFFSET,static_cast<uint16_t>(dailyPersonCount));
- stateOfCharge = batteryMonitor.getSoC();
- FRAMwrite8(pointer+DAILYBATTOFFSET,stateOfCharge);
- uint8_t newDailyPointerAddr = (FRAMread8(DAILYPOINTERADDR)+1) % DAILYCOUNTNUMBER;  // This is where we "wrap" the count to stay in our memory space
- FRAMwrite8(DAILYPOINTERADDR,newDailyPointerAddr);
-}
-
-void sendEvent(bool dailyEvent)
-{
-  getSignalStrength();
-  int currentTemp = getTemperature();  // in degrees F
-  stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charge
   char data[256];                                         // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i}",hourlyPersonCount, dailyPersonCount, stateOfCharge, currentTemp);
-  Particle.publish("Send_Counts", data, PRIVATE);
-  if (dailyEvent)
-  {
-    Particle.publish("State","SendEvent Day");
-    dailyPersonCountSent = dailyPersonCount; // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
-    currentDailyPeriod = Time.day();  // Change the time period
-  }
+  snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i, \"resets\":%i}",hourlyPersonCount, dailyPersonCount, stateOfCharge, temperatureF,resetCount);
+  Particle.publish("Ubidots-Hook", data, PRIVATE);
   hourlyPersonCountSent = hourlyPersonCount; // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
   currentHourlyPeriod = Time.hour();  // Change the time period
-  dataInFlight = true; // set the data in flight flag
+  dataInFlight = true; // set the data inflight flag
 }
 
 void UbidotsHandler(const char *event, const char *data)  // Looks at the response from Ubidots - Will reset Photon if no successful response
@@ -446,7 +420,7 @@ int resetCounts(String command)   // Resets the current hourly and daily counts
   else return 0;
 }
 
-int resetNow(String command)   // Will reset the local counts
+int resetNow(String command)   // Will reset the Electron
 {
   if (command == "1")
   {
@@ -460,7 +434,7 @@ int sendNow(String command) // Function to force sending data in current hour
 {
   if (command == "1")
   {
-    sendEvent(0);
+    state = REPORTING_STATE;
     return 1;
   }
   else return 0;
@@ -479,4 +453,43 @@ int getTemperature()
 void sensorISR()
 {
   sensorDetect = true;                                      // sets the sensor flag for the main loop
+}
+
+void watchdogISR()
+{
+  digitalWrite(donePin, HIGH);                              // Pet the watchdog
+  digitalWrite(donePin, LOW);
+}
+
+bool connectToParticle()
+{
+  if (!Cellular.ready())
+  {
+    Cellular.on();                                           // turn on the Modem
+    Cellular.connect();                                      // Connect to the cellular network
+    if(!waitFor(Cellular.ready,90000)) return false;         // Connect to cellular - give it 90 seconds
+  }
+  Particle.connect();                                      // Connect to Particle
+  if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
+  return true;
+}
+
+bool disconnectFromParticle()
+{
+  Particle.disconnect();                                   // Disconnect from Particle in prep for sleep
+  waitFor(notConnected,10000);
+  Cellular.disconnect();                                   // Disconnect from the cellular network
+  delay(3000);
+  Cellular.off();                                           // Turn off the cellular modem
+  return true;
+}
+
+bool notConnected() {
+  return !Particle.connected();                             // This is a requirement to use waitFor
+}
+
+void takeMeasurements() {
+  getSignalStrength();                                      // Test signal strength at startup
+  getTemperature();                                         // Get Temperature at startup as well
+  stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
 }
