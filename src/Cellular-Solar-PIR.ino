@@ -35,7 +35,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.56"
+#define SOFTWARERELEASENUMBER "0.60"
 #define PARKCLOSES 20
 #define PARKOPENS 7
 
@@ -151,6 +151,8 @@ void setup()
   Particle.function("resetFRAM", resetFRAM);
   Particle.function("resetCounts",resetCounts);
   Particle.function("Reset",resetNow);
+  Particle.function("HardReset",hardResetNow);
+  Particle.function("SleepInFive",sleepInFive);
   Particle.function("SendNow",sendNow);
 
   if (!fram.begin()) {                // you can stick the new i2c addr in here, e.g. begin(0x51);
@@ -250,7 +252,7 @@ void loop()
     } break;
 
   case REPORTING_STATE: {
-    timeTillSleep = sleepDelay;     // Sets the sleep delay to 60 seconds after reporting to give time to flash if needed
+    timeTillSleep = sleepDelay;                              // Sets the sleep delay to give time to flash if needed
     if (!connectToParticle()) {
       state = ERROR_STATE;
       break;
@@ -429,6 +431,27 @@ int resetNow(String command)   // Will reset the Electron
   }
   else return 0;
 }
+
+int hardResetNow(String command)   // Will perform a hard reset on the Electron
+{
+  if (command == "1")
+  {
+    digitalWrite(hardResetPin,HIGH);
+    return 1;
+  }
+  else return 0;
+}
+
+int sleepInFive(String command)   // Will perform a hard reset on the Electron
+{
+  if (command == "1")
+  {
+    timeTillSleep = 300000;       // Set this equal to 5 minutes.  Will reset in the program once it goes to NAPPING_STATE
+    return 1;
+  }
+  else return 0;
+}
+
 
 int sendNow(String command) // Function to force sending data in current hour
 {
