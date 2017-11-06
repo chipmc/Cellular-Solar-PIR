@@ -171,7 +171,7 @@ void setup()
     FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(resetCount));          // If so, store incremented number - watchdog must have done This
   }
 
-  Time.zone(-4);                              // Set time zone to Eastern USA daylight saving time
+  Time.zone(-5);                              // Set time zone to Eastern USA daylight saving time
   takeMeasurements();
   StartStopTest(1);                           // Default action is for the test to be running
   timeTillSleep = sleepDelay;                 // Set initial delay for 60 seconds
