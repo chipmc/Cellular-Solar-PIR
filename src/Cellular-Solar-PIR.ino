@@ -35,7 +35,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.60"
+#define SOFTWARERELEASENUMBER "0.65"
 #define PARKCLOSES 20
 #define PARKOPENS 7
 
@@ -51,7 +51,7 @@ FuelGauge batteryMonitor;       // Prototype for the fuel gauge (included in Par
 PMIC power;                      //Initalize the PMIC class so you can call the Power Management functions below.
 
 // State Maching Variables
-enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, REPORTING_STATE, RESP_WAIT_STATE };
+enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, LOW_BATTERY_STATE, REPORTING_STATE, RESP_WAIT_STATE };
 State state = INITIALIZATION_STATE;
 
 // Pin Constants
@@ -70,7 +70,7 @@ unsigned long publishTimeStamp = 0;         // Keep track of when we publish a w
 unsigned long webhookWaitTime = 45000;      // How long will we let a webhook go before we give up
 unsigned long resetWaitTimeStamp = 0;       // Starts the reset wait clock
 unsigned long resetWaitTime = 30000;        // Will wait this lonk before resetting.
-unsigned long sleepDelay = 90000;           // Longer delay before sleep when booting up or on the hour - gives time to flash
+unsigned long sleepDelay = 60000;           // Longer delay before sleep when booting up or on the hour - gives time to flash
 unsigned long timeTillSleep = 0;            // This will either be short or long depending on nap or sleep
 unsigned long napDelay = 3000;              // Normal amount of time after event before taking a nap
 unsigned long lastEvent = 0;                // Keeps track of the last time there was an event
@@ -102,52 +102,48 @@ volatile bool sensorDetect = false;         // This is the flag that an interrup
 int stateOfCharge = 0;                      // stores battery charge level value
 
 //Menu and Program Variables
-uint32_t lastBump = 0;         // set the time of an event
-bool inTest = false;             // Are we in a test or not
-retained char Signal[17];                            // Used to communicate Wireless RSSI and Description
+uint32_t lastBump = 0;                // set the time of an event
+bool inTest = false;                  // Are we in a test or not
+retained char Signal[17];             // Used to communicate Wireless RSSI and Description
+char Status[17] = "";                 // Used to communciate updates on System Status
 const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
 
-void setup()
+void setup()                                                      // Note: Disconnected Setup()
 {
-  pinMode(intPin,INPUT);
-  pinMode(wakeUpPin,INPUT);                   // This pin is active HIGH
-  pinMode(blueLED, OUTPUT);                   // declare the Blue LED Pin as an output
-  pinMode(tmp36Shutdwn,OUTPUT);               // Supports shutting down the TMP-36 to save juice
-  digitalWrite(tmp36Shutdwn, HIGH);           // Turns on the temp sensor
-  pinMode(donePin,OUTPUT);                    // Allows us to pet the watchdog
-  pinMode(hardResetPin,OUTPUT);               // For a hard reset - HIGH
+  pinMode(intPin,INPUT);                                          // PIR Sensor Interrupt pin
+  pinMode(wakeUpPin,INPUT);                                       // This pin is active HIGH
+  pinMode(blueLED, OUTPUT);                                       // declare the Blue LED Pin as an output
+  pinMode(tmp36Shutdwn,OUTPUT);                                   // Supports shutting down the TMP-36 to save juice
+  digitalWrite(tmp36Shutdwn, HIGH);                               // Turns on the temp sensor
+  pinMode(donePin,OUTPUT);                                        // Allows us to pet the watchdog
+  pinMode(hardResetPin,OUTPUT);                                   // For a hard reset active HIGH
 
-  if(!connectToParticle()) digitalWrite(hardResetPin,HIGH);    // If connection fails, bounce the power
-  Particle.publish("State","Initalizing");
-
-  power.begin();
+  power.begin();                                                  // Settings for Solar powered power management
   power.disableWatchdog();
   power.disableDPDM();
   power.setInputVoltageLimit(4840);     //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
-  power.setInputCurrentLimit(900);     // default is 900mA
-  power.setChargeCurrent(0,0,0,0,0,0); // default is 512mA
-  power.setChargeVoltage(4112);        // default is 4.112V termination voltage
+  power.setInputCurrentLimit(900);                                // default is 900mA
+  power.setChargeCurrent(0,0,0,0,0,0);                            // default is 512mA matches my 3W panel
+  power.setChargeVoltage(4112);                                   // default is 4.112V termination voltage
   power.enableDPDM();
-
-  stateOfCharge = int(batteryMonitor.getSoC()); // Percentage of full charge
 
   attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
   attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
 
   char responseTopic[125];
-  String deviceID = System.deviceID();
+  String deviceID = System.deviceID();                                // Multiple Electrons share the same hook - keeps things straight
   deviceID.toCharArray(responseTopic,125);
   Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
 
-  Particle.variable("HourlyCount", hourlyPersonCount);
-  Particle.variable("DailyCount", dailyPersonCount);
+  Particle.variable("HourlyCount", hourlyPersonCount);                // Define my Particle variables
+  Particle.variable("DailyCount", dailyPersonCount);                  // Note: Don't have to be connected for any of this!!!
   Particle.variable("Signal", Signal);
   Particle.variable("ResetCount", resetCount);
   Particle.variable("Temperature",temperatureF);
   Particle.variable("Release",releaseNumber);
   Particle.variable("stateOfChg", stateOfCharge);
 
-  Particle.function("startStop", startStop);
+  Particle.function("startStop", startStop);                          // Define my Particle functions
   Particle.function("resetFRAM", resetFRAM);
   Particle.function("resetCounts",resetCounts);
   Particle.function("Reset",resetNow);
@@ -155,35 +151,30 @@ void setup()
   Particle.function("SleepInFive",sleepInFive);
   Particle.function("SendNow",sendNow);
 
-  if (!fram.begin()) {                // you can stick the new i2c addr in here, e.g. begin(0x51);
-    Particle.publish("Startup","No FRAM");
+  if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
+    snprintf(Status,13,"Missing FRAM");                                 // Can't communicate with FRAM - fatal error
     state = ERROR_STATE;
   }
-
-  if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {  // Check to see if the memory map in the sketch matches the data on the chip
-    Particle.publish("Startup","FRAM mismatch - erasing");
-    ResetFRAM();                        // Reset the FRAM to correct the issue
-    if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) state = ERROR_STATE;  // Resetting did not fix the issue
+  else if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {                   // Check to see if the memory map in the sketch matches the data on the chip
+    snprintf(Status,13,"Erasing FRAM");
+    ResetFRAM();                                                        // Reset the FRAM to correct the issue
+    if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) state = ERROR_STATE;   // Resetting did not fix the issue
   }
 
-  resetCount = FRAMread8(RESETCOUNT);         // Retrive system recount data from FRAMwrite8
-  if (System.resetReason() == RESET_REASON_PIN_RESET)  // Check to see if we are starting from a pin reset
+  resetCount = FRAMread8(RESETCOUNT);                                   // Retrive system recount data from FRAMwrite8
+  if (System.resetReason() == RESET_REASON_PIN_RESET)                   // Check to see if we are starting from a pin reset
   {
     resetCount++;
-    FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(resetCount));          // If so, store incremented number - watchdog must have done This
+    FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(resetCount));            // If so, store incremented number - watchdog must have done This
   }
 
-  Time.zone(-5);                              // Set time zone to Eastern USA daylight saving time
+  Time.zone(-5);                                                        // Set time zone to Eastern USA daylight saving time
   takeMeasurements();
-  StartStopTest(1);                           // Default action is for the test to be running
-  timeTillSleep = sleepDelay;                 // Set initial delay for 60 seconds
+  StartStopTest(1);                                                     // Default action is for the test to be running
+  timeTillSleep = sleepDelay;                                           // Set initial delay for 60 seconds
+  lastEvent = millis();
 
-  if (stateOfCharge <= 20)  state = SLEEPING_STATE;   // Low battery level will cause an ERROR and reset which brings us here
-  else if (state != ERROR_STATE)                      // IDLE unless error from above code
-  {
-    state = IDLE_STATE;                                // Idle and look for events to change the state
-    Particle.publish("State","Idle");
-  }
+  if (state != ERROR_STATE) state = IDLE_STATE;                         // IDLE unless error from above code
 }
 
 void loop()
@@ -197,13 +188,18 @@ void loop()
     }
     if (sensorDetect) recordCount();                                                  // The ISR had raised the sensor flag
     if (millis() >= (lastEvent + timeTillSleep)) state = NAPPING_STATE;               // Too long since last sensor flag - time to nap
+    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;   // We want to report on the hour but not after bedtime
     if (Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS) state = SLEEPING_STATE;  // The park is closed, time to sleep
-    if (Time.hour() != currentHourlyPeriod && !readyForBed) state = REPORTING_STATE;   // We want to report on the hour but not after bedtime
+    if (stateOfCharge <= 30) LOW_BATTERY_STATE;                                           // The battery is low - sleep
     break;
 
   case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
     if (!readyForBed)                                           // Only do these things once - at bedtime
     {
+      if (hourlyPersonCount) {                                  // If this number is not zero then we need to send this last count
+        state = REPORTING_STATE;
+        break;
+      }
       if (Particle.connected()) {
         disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
       }
@@ -237,18 +233,42 @@ void loop()
     } break;
 
   case NAPPING_STATE: {
-    if (Particle.connected())
-    {
-      disconnectFromParticle();                              // If connected, we need to disconned and power down the modem
-      timeTillSleep = napDelay;                              // Set the time we will wait before napping again
-    }
-    ledState = false;                                        // Turn out the light
-    digitalWrite(blueLED,LOW);                               // Turn off the LED
-    sensorDetect = true;                                     // Woke up so there must have been an event
-    lastEvent = millis();                                    // Reset millis so we don't wake and then nap again
-    int secondsToHour = (60*(60 - Time.minute()));           // Time till the top of the hour
-    System.sleep(intPin,RISING,secondsToHour);               // Sensor will wake us with an interrupt
-    state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
+      if (Particle.connected())
+      {
+        disconnectFromParticle();                              // If connected, we need to disconned and power down the modem
+      }
+      timeTillSleep = napDelay;                                // Set the time we will wait before napping again
+      lastEvent = millis();                                    // Reset millis so we don't wake and then nap again
+      ledState = false;                                        // Turn out the light
+      digitalWrite(blueLED,LOW);                               // Turn off the LED
+      sensorDetect = true;                                     // Woke up so there must have been an event
+      int secondsToHour = (60*(60 - Time.minute()));           // Time till the top of the hour
+      System.sleep(intPin, RISING, secondsToHour);             // Sensor will wake us with an interrupt
+      state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
+    } break;
+
+  case LOW_BATTERY_STATE: {
+      if (Particle.connected()) {
+        disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
+      }
+      detachInterrupt(intPin);                                  // Done sensing for the day
+      ledState = false;
+      digitalWrite(blueLED,LOW);                                // Turn off the LED
+      digitalWrite(tmp36Shutdwn, LOW);                          // Turns off the temp sensor
+      digitalWrite(donePin,HIGH);
+      digitalWrite(donePin,LOW);                                // Pet the watchdog
+      int secondsToHour = (60*(60 - Time.minute()));            // Time till the top of the hour
+      System.sleep(SLEEP_MODE_DEEP,secondsToHour);              // Very deep sleep till the next hour (cellular, uC and Fuel Gauge off)
+      digitalWrite(donePin,HIGH);
+      digitalWrite(donePin,LOW);                                // Pet the watchdog
+      stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
+      if (stateOfCharge > 30)                                   // Time to wake up and go to work
+      {
+        state = IDLE_STATE;                                       // Go to IDLE state for more instructions once we awake
+        lastEvent = millis();                                     // Reset millis so we don't wake and then nap again
+        attachInterrupt(intPin,sensorISR,RISING);                 // Sensor interrupt from low to high
+        digitalWrite(tmp36Shutdwn,HIGH);                          // Turn on the temp sensor
+      }
     } break;
 
   case REPORTING_STATE: {
@@ -258,6 +278,11 @@ void loop()
       break;
     }
     takeMeasurements();
+    if (Status[0] != '\0')
+    {
+      Particle.publish("Status",Status);  // Will continue - even if not connected.
+      Status[0] = '\0';
+    }
     LogHourlyEvent();
     sendEvent();
     publishTimeStamp = millis();
@@ -270,11 +295,13 @@ void loop()
   case RESP_WAIT_STATE:
     if (!dataInFlight)                                  // Response received
     {
-      if (stateOfCharge <= 20) state = ERROR_STATE;     // Very low battery, time to reset then sleep
-      else state = IDLE_STATE;                          // Battery OK, proceed
+      state = IDLE_STATE;
       Particle.publish("State","Idle");
     }
-    else if (millis() >= (publishTimeStamp + webhookWaitTime)) state = ERROR_STATE;  // Response timed out
+    else if (millis() >= (publishTimeStamp + webhookWaitTime)) {
+      state = ERROR_STATE;  // Response timed out
+      Particle.publish("State","Response Timeout Error");
+    }
     break;
 
   case ERROR_STATE:                                          // To be enhanced - where we deal with errors
@@ -282,9 +309,15 @@ void loop()
     {
       waiting = true;
       resetWaitTimeStamp = millis();
-      Particle.publish("State","Error");
     }
-    if (millis() >= (resetWaitTimeStamp + resetWaitTime)) System.reset();   // Today, only way out is reset
+    if (millis() >= (resetWaitTimeStamp + resetWaitTime))
+    {
+      if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
+      else {
+        FRAMwrite8(RESETCOUNT,0);                           // Time for a hard reset
+        digitalWrite(hardResetPin,HIGH);                    // Zero the count so only every three
+      }
+    }
     break;
   }
 }
@@ -294,7 +327,6 @@ void recordCount()                                          // Handles counting 
   sensorDetect = false;                                     // Reset the flag
   if (digitalRead(intPin)) {
     Particle.publish("State","Counting");
-    if (Time.minute() > 2) timeTillSleep = napDelay;        // reset the time we will wait before napping again
     lastEvent = millis();                                   // Important to keep from napping too soon
     t = Time.now();
     hourlyPersonCount++;                    // Increment the PersonCount
@@ -304,6 +336,9 @@ void recordCount()                                          // Handles counting 
     FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
     ledState = !ledState;              // toggle the status of the LEDPIN:
     digitalWrite(blueLED, ledState);    // update the LED pin itself
+  }
+  if (!digitalRead(userSwitch)) {     // A low value means someone is pushing this button
+    state = REPORTING_STATE;          // If so, connect and send data - this let's us interact with the device if needed
   }
 }
 
@@ -447,6 +482,7 @@ int sleepInFive(String command)   // Will perform a hard reset on the Electron
   if (command == "1")
   {
     timeTillSleep = 300000;       // Set this equal to 5 minutes.  Will reset in the program once it goes to NAPPING_STATE
+    lastEvent = millis();
     return 1;
   }
   else return 0;
@@ -492,8 +528,10 @@ bool connectToParticle()
     Cellular.connect();                                      // Connect to the cellular network
     if(!waitFor(Cellular.ready,90000)) return false;         // Connect to cellular - give it 90 seconds
   }
+  Particle.process();
   Particle.connect();                                      // Connect to Particle
   if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
+  Particle.process();
   return true;
 }
 
@@ -512,7 +550,7 @@ bool notConnected() {
 }
 
 void takeMeasurements() {
-  getSignalStrength();                                      // Test signal strength at startup
+  if (Cellular.ready()) getSignalStrength();                // Test signal strength if the cellular modem is on and ready
   getTemperature();                                         // Get Temperature at startup as well
   stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
 }
