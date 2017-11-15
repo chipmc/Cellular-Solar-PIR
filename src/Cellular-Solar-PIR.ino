@@ -35,9 +35,9 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.65"
-#define PARKCLOSES 20
-#define PARKOPENS 7
+#define SOFTWARERELEASENUMBER "0.75"
+#define PARKCLOSES 18
+#define PARKOPENS 6
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -82,6 +82,7 @@ int temperatureF;                    // Global variable so we can monitor via cl
 int resetCount;                      // Counts the number of times the Electron has had a pin reset
 bool ledState = LOW;                        // variable used to store the last LED status, to toggle the light
 const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on the menu
+int lowBattLimit = 30;              // Trigger for Low Batt State
 
 // FRAM and Unix time variables
 time_t t;
@@ -116,16 +117,11 @@ void setup()                                                      // Note: Disco
   pinMode(tmp36Shutdwn,OUTPUT);                                   // Supports shutting down the TMP-36 to save juice
   digitalWrite(tmp36Shutdwn, HIGH);                               // Turns on the temp sensor
   pinMode(donePin,OUTPUT);                                        // Allows us to pet the watchdog
+  digitalWrite(donePin,HIGH);
+  digitalWrite(donePin,LOW);                                      // Pet the watchdog
   pinMode(hardResetPin,OUTPUT);                                   // For a hard reset active HIGH
 
-  power.begin();                                                  // Settings for Solar powered power management
-  power.disableWatchdog();
-  power.disableDPDM();
-  power.setInputVoltageLimit(4840);     //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
-  power.setInputCurrentLimit(900);                                // default is 900mA
-  power.setChargeCurrent(0,0,0,0,0,0);                            // default is 512mA matches my 3W panel
-  power.setChargeVoltage(4112);                                   // default is 4.112V termination voltage
-  power.enableDPDM();
+  PMICreset();                                                    // Executes commands that set up the PMIC for Solar charging
 
   attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
   attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
@@ -190,7 +186,7 @@ void loop()
     if (millis() >= (lastEvent + timeTillSleep)) state = NAPPING_STATE;               // Too long since last sensor flag - time to nap
     if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;   // We want to report on the hour but not after bedtime
     if (Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS) state = SLEEPING_STATE;  // The park is closed, time to sleep
-    if (stateOfCharge <= 30) LOW_BATTERY_STATE;                                           // The battery is low - sleep
+    if (stateOfCharge <= lowBattLimit) LOW_BATTERY_STATE;                                           // The battery is low - sleep
     break;
 
   case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
@@ -218,18 +214,7 @@ void loop()
       readyForBed = true;                                       // Set the flag for the night
     }
     int secondsToHour = (60*(60 - Time.minute()));              // Time till the top of the hour
-    System.sleep(SLEEP_MODE_DEEP,secondsToHour);        // Very deep sleep till the next hour (cellular, uC and Fuel Gauge off)
-    digitalWrite(donePin,HIGH);
-    digitalWrite(donePin,LOW);                                  // Pet the watchdog
-    if (Time.hour() < PARKCLOSES && Time.hour() >= PARKOPENS)   // Time to wake up and go to work
-    {
-      state = IDLE_STATE;                                       // Go to IDLE state for more instructions once we awake
-      lastEvent = millis();                                     // Reset millis so we don't wake and then nap again
-      attachInterrupt(intPin,sensorISR,RISING);                 // Sensor interrupt from low to high
-      currentDailyPeriod = Time.day();                          // Waking from a night's sleep - it is a new day
-      digitalWrite(tmp36Shutdwn,HIGH);                          // Turn on the temp sensor
-      readyForBed = false;
-    }
+    System.sleep(SLEEP_MODE_DEEP,secondsToHour);                // Very deep sleep till the next hour - then resets
     } break;
 
   case NAPPING_STATE: {
@@ -258,17 +243,7 @@ void loop()
       digitalWrite(donePin,HIGH);
       digitalWrite(donePin,LOW);                                // Pet the watchdog
       int secondsToHour = (60*(60 - Time.minute()));            // Time till the top of the hour
-      System.sleep(SLEEP_MODE_DEEP,secondsToHour);              // Very deep sleep till the next hour (cellular, uC and Fuel Gauge off)
-      digitalWrite(donePin,HIGH);
-      digitalWrite(donePin,LOW);                                // Pet the watchdog
-      stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
-      if (stateOfCharge > 30)                                   // Time to wake up and go to work
-      {
-        state = IDLE_STATE;                                       // Go to IDLE state for more instructions once we awake
-        lastEvent = millis();                                     // Reset millis so we don't wake and then nap again
-        attachInterrupt(intPin,sensorISR,RISING);                 // Sensor interrupt from low to high
-        digitalWrite(tmp36Shutdwn,HIGH);                          // Turn on the temp sensor
-      }
+      System.sleep(SLEEP_MODE_DEEP,secondsToHour);              // Very deep sleep till the next hour - then resets
     } break;
 
   case REPORTING_STATE: {
@@ -553,4 +528,15 @@ void takeMeasurements() {
   if (Cellular.ready()) getSignalStrength();                // Test signal strength if the cellular modem is on and ready
   getTemperature();                                         // Get Temperature at startup as well
   stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
+}
+
+void PMICreset() {
+  power.begin();                                                  // Settings for Solar powered power management
+  power.disableWatchdog();
+  power.disableDPDM();
+  power.setInputVoltageLimit(4840);     //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
+  power.setInputCurrentLimit(900);                                // default is 900mA
+  power.setChargeCurrent(0,0,0,0,0,0);                            // default is 512mA matches my 3W panel
+  power.setChargeVoltage(4112);                                   // default is 4.112V termination voltage
+  power.enableDPDM();
 }
